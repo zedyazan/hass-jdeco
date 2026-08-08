@@ -149,7 +149,7 @@ class JDecoAPI:
                 if resp.status != 200:
                     raise JDecoAPIError(f"HTTP {resp.status}")
                 text = await resp.text()
-                _LOGGER.debug("Response: %s", text[:300])
+                _LOGGER.debug("Response received for method: %s (size: %d bytes)", method, len(text))
                 payload = json.loads(text)
                 result_key = f"{method}Result"
                 return payload.get(result_key, payload)
