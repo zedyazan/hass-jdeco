@@ -1,0 +1,19 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "JDECo Login",
+        "description": "Enter your JDECo app credentials"
+      },
+      "agreement": {
+        "title": "Select Agreement",
+        "description": "Choose the electricity agreement"
+      }
+    },
+    "error": {
+      "auth_failed": "Invalid username or password",
+      "no_agreements": "No agreements linked to this account",
+      "unknown": "Something went wrong"
+    }
+  }
+}
