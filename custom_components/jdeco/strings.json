@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "data": {
+          "username": "Username / phone",
+          "password": "Password"
+        }
+      },
+      "agreement": {
+        "data": {
+          "agreement_no": "Agreement"
+        }
+      }
+    },
+    "error": {
+      "auth_failed": "Authentication failed",
+      "no_agreements": "No agreements found",
+      "unknown": "Unexpected error"
+    }
+  }
+}
