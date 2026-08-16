@@ -17,6 +17,7 @@ from Crypto.Util.Padding import pad, unpad
 
 from .const import (
     API_BASE_URL,
+    API_BASE_URL_ALT,
     APP_SYSTEM_ID,
     DEFAULT_TIMEOUT,
     FRF_VALUE,
@@ -36,6 +37,14 @@ MAX_RETRIES = 3
 INITIAL_BACKOFF = 1.0  # seconds
 MAX_BACKOFF = 16.0  # seconds
 BACKOFF_MULTIPLIER = 2.0
+
+# Alternative endpoints to try (in order of preference)
+API_ENDPOINTS = [
+    "https://androidAPP.jdeco.net:2083/V3GACG",
+    "https://androidapp.jdeco.net:2083/V3GACG",
+    "https://androidAPP.jdeco.net:2083/GACG",
+    "https://androidapp.jdeco.net:2083/GACG",
+]
 
 
 class JDecoAPIError(Exception):
@@ -61,6 +70,7 @@ class JDecoAPI:
         self._password = password
         self._device_id = device_id or str(uuid.uuid4())
         self._base_url = API_BASE_URL
+        self._working_endpoint: str | None = None  # Cache working endpoint
         self._aes_key: bytes | None = None
         self._auth_token: str | None = None
         self._public_key: str | None = None  # Cache public key
@@ -135,7 +145,7 @@ class JDecoAPI:
             raise JDecoAuthError(f"Unexpected error during authentication: {err}") from err
 
     async def _request_pk(self) -> str | None:
-        """Request public key with caching."""
+        """Request public key with caching and endpoint fallback."""
         if self._public_key:
             return self._public_key
         
@@ -173,7 +183,7 @@ class JDecoAPI:
     async def _post(
         self, method: str, extra_params: dict, auth_required: bool = True
     ) -> dict | list | None:
-        """Make a POST request with retry logic."""
+        """Make a POST request with retry logic and endpoint fallback."""
         body = {
             "systemID": APP_SYSTEM_ID,
             "authKey": self._auth_token if auth_required else "",
@@ -182,72 +192,113 @@ class JDecoAPI:
         }
         body.update(extra_params)
 
-        # Retry loop with exponential backoff
-        last_error = None
-        backoff = INITIAL_BACKOFF
+        # If we have a working endpoint, try it first
+        endpoints_to_try = []
+        if self._working_endpoint:
+            endpoints_to_try.append(self._working_endpoint)
+        endpoints_to_try.extend([ep for ep in API_ENDPOINTS if ep != self._working_endpoint])
+
+        endpoint_errors = {}
         
-        for attempt in range(MAX_RETRIES):
-            try:
-                async with self._session.post(
-                    self._base_url,
-                    json=body,
-                    timeout=aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT),
-                ) as resp:
-                    if resp.status != 200:
+        for endpoint in endpoints_to_try:
+            endpoint_error = None
+            last_error = None
+            backoff = INITIAL_BACKOFF
+            
+            for attempt in range(MAX_RETRIES):
+                try:
+                    async with self._session.post(
+                        endpoint,
+                        json=body,
+                        timeout=aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT),
+                    ) as resp:
+                        if resp.status != 200:
+                            text = await resp.text()
+                            error_msg = f"HTTP {resp.status}: {text[:200]}"
+                            _LOGGER.warning("API error on attempt %d at %s: %s", attempt + 1, endpoint, error_msg)
+                            last_error = JDecoAPIError(error_msg)
+                            
+                            # Don't retry on auth errors
+                            if resp.status == 401:
+                                raise JDecoAuthError("Unauthorized - check credentials")
+                            
+                            if attempt < MAX_RETRIES - 1:
+                                await asyncio.sleep(backoff)
+                                backoff = min(backoff * BACKOFF_MULTIPLIER, MAX_BACKOFF)
+                                continue
+                            endpoint_error = last_error
+                            break
+                        
                         text = await resp.text()
-                        error_msg = f"HTTP {resp.status}: {text[:200]}"
-                        _LOGGER.warning("API error on attempt %d: %s", attempt + 1, error_msg)
-                        last_error = JDecoAPIError(error_msg)
                         
-                        # Don't retry on auth errors
-                        if resp.status == 401:
-                            raise JDecoAuthError("Unauthorized - check credentials")
+                        # Check for empty response
+                        if not text or not text.strip():
+                            error_msg = f"Empty response from {endpoint}/{method}"
+                            _LOGGER.warning("%s on attempt %d", error_msg, attempt + 1)
+                            last_error = JDecoAPIError(error_msg)
+                            
+                            if attempt < MAX_RETRIES - 1:
+                                await asyncio.sleep(backoff)
+                                backoff = min(backoff * BACKOFF_MULTIPLIER, MAX_BACKOFF)
+                                continue
+                            endpoint_error = last_error
+                            break
                         
-                        if attempt < MAX_RETRIES - 1:
-                            await asyncio.sleep(backoff)
-                            backoff = min(backoff * BACKOFF_MULTIPLIER, MAX_BACKOFF)
-                            continue
-                        raise last_error
+                        # Only log method and response size to avoid sensitive data leaks
+                        _LOGGER.debug("API response status: 200, method: %s, size: %d bytes", method, len(text))
+                        
+                        try:
+                            payload = json.loads(text)
+                        except json.JSONDecodeError as err:
+                            raise JDecoAPIError(f"Invalid JSON response: {err}") from err
+                        
+                        # Check for API-level errors in the response
+                        if isinstance(payload, dict):
+                            if "errorCode" in payload and payload["errorCode"] != 0:
+                                error_msg = payload.get("message", f"API error code {payload['errorCode']}")
+                                raise JDecoAPIError(f"API returned error: {error_msg}")
+                        
+                        # Cache the working endpoint
+                        if not self._working_endpoint:
+                            self._working_endpoint = endpoint
+                            _LOGGER.info("Using JDECo API endpoint: %s", endpoint)
+                        
+                        result_key = f"{method}Result"
+                        return payload.get(result_key, payload)
+                        
+                except asyncio.TimeoutError as err:
+                    error_msg = "Request timeout"
+                    _LOGGER.warning("%s on attempt %d at %s", error_msg, attempt + 1, endpoint)
+                    last_error = JDecoAPIError(error_msg)
                     
-                    text = await resp.text()
-                    # Only log method and response size to avoid sensitive data leaks
-                    _LOGGER.debug("API response status: 200, method: %s, size: %d bytes", method, len(text))
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * BACKOFF_MULTIPLIER, MAX_BACKOFF)
+                        continue
+                    endpoint_error = last_error
+                    break
                     
-                    try:
-                        payload = json.loads(text)
-                    except json.JSONDecodeError as err:
-                        raise JDecoAPIError(f"Invalid JSON response: {err}") from err
+                except aiohttp.ClientError as err:
+                    error_msg = f"Connection error: {err}"
+                    _LOGGER.warning("%s on attempt %d at %s", error_msg, attempt + 1, endpoint)
+                    last_error = JDecoAPIError(error_msg)
                     
-                    # Check for API-level errors in the response
-                    if isinstance(payload, dict):
-                        if "errorCode" in payload and payload["errorCode"] != 0:
-                            error_msg = payload.get("message", f"API error code {payload['errorCode']}")
-                            raise JDecoAPIError(f"API returned error: {error_msg}")
-                    
-                    result_key = f"{method}Result"
-                    return payload.get(result_key, payload)
-                    
-            except asyncio.TimeoutError as err:
-                error_msg = "Request timeout"
-                _LOGGER.warning("%s on attempt %d", error_msg, attempt + 1)
-                last_error = JDecoAPIError(error_msg)
-                
-                if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * BACKOFF_MULTIPLIER, MAX_BACKOFF)
-                    continue
-                raise last_error
-                
-            except aiohttp.ClientError as err:
-                error_msg = f"Connection error: {err}"
-                _LOGGER.warning("%s on attempt %d", error_msg, attempt + 1)
-                last_error = JDecoAPIError(error_msg)
-                
-                if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * BACKOFF_MULTIPLIER, MAX_BACKOFF)
-                    continue
-                raise last_error
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * BACKOFF_MULTIPLIER, MAX_BACKOFF)
+                        continue
+                    endpoint_error = last_error
+                    break
+            
+            if endpoint_error:
+                endpoint_errors[endpoint] = str(endpoint_error)
+            else:
+                # If we got here without returning, all retries failed
+                if last_error:
+                    endpoint_errors[endpoint] = str(last_error)
         
-        # Should not reach here, but just in case
-        raise last_error or JDecoAPIError("Unknown error after retries")
+        # All endpoints failed
+        error_summary = " | ".join(
+            [f"{ep}: {err}" for ep, err in endpoint_errors.items()]
+        )
+        raise JDecoAPIError(f"All JDECo endpoints failed. Errors: {error_summary}")
