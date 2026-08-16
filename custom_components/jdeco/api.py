@@ -90,8 +90,9 @@ class JDecoAPI:
             self._aes_key = aes_key
 
             try:
+                # Use SHA-1 for RSA encryption (matching official JDECo app)
                 rsa_key = RSA.import_key(pub_key_pem)
-                cipher_rsa = PKCS1_OAEP.new(rsa_key, hashlib.sha256)
+                cipher_rsa = PKCS1_OAEP.new(rsa_key, hashlib.sha1)
                 encrypted_aes_key = cipher_rsa.encrypt(aes_key)
                 encrypted_aes_key_b64 = base64.b64encode(encrypted_aes_key).decode()
             except (ValueError, IndexError) as err:
@@ -243,6 +244,10 @@ class JDecoAPI:
                                 continue
                             endpoint_error = last_error
                             break
+                        
+                        # Strip UTF-8 BOM if present (as noted in APK analysis)
+                        if text.startswith('\ufeff'):
+                            text = text[1:]
                         
                         # Only log method and response size to avoid sensitive data leaks
                         _LOGGER.debug("API response status: 200, method: %s, size: %d bytes", method, len(text))
