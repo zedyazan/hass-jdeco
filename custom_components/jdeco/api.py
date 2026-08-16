@@ -71,6 +71,16 @@ class JDecoAPI:
         self._device_id = device_id or str(uuid.uuid4())
         self._base_url = API_BASE_URL
         self._working_endpoint: str | None = None  # Cache working endpoint
+        
+        # Generate client RSA keypair for mutual key exchange
+        self._client_rsa_key = RSA.generate(2048)
+        self._client_rsa_pub_pem = self._client_rsa_key.publickey().export_key(format='DER')
+        self._client_rsa_pub_b64 = base64.b64encode(self._client_rsa_pub_pem).decode()
+        
+        # Generate client AES session key for mutual authentication
+        self._client_aes_key = get_random_bytes(32)
+        self._client_aes_key_b64 = base64.b64encode(self._client_aes_key).decode()
+        
         self._aes_key: bytes | None = None
         self._auth_token: str | None = None
         self._public_key: str | None = None  # Cache public key
@@ -102,6 +112,7 @@ class JDecoAPI:
                 "userName": self._username,
                 "password": self._password,
                 "encryptedAesKey": encrypted_aes_key_b64,
+                "stsb": self._client_aes_key_b64,  # Include client session key
             }
             login_result = await self._post(
                 METHOD_VERIFY_CREDENTIALS, login_params, auth_required=False
@@ -146,11 +157,19 @@ class JDecoAPI:
             raise JDecoAuthError(f"Unexpected error during authentication: {err}") from err
 
     async def _request_pk(self) -> str | None:
-        """Request public key with caching and endpoint fallback."""
+        """Request public key with mutual key exchange (client PK + stsb required)."""
         if self._public_key:
             return self._public_key
         
-        result = await self._post(METHOD_REQUEST_PK, {}, auth_required=False)
+        # The requestPK call requires client's public key and session key for mutual exchange
+        result = await self._post(
+            METHOD_REQUEST_PK, 
+            {
+                "PK": self._client_rsa_pub_b64,
+                "stsb": self._client_aes_key_b64,
+            },
+            auth_required=False
+        )
         if result and "publicKey" in result:
             self._public_key = result["publicKey"]
             return self._public_key
